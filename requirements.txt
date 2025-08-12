@@ -1,0 +1,23 @@
+# Core Libraries
+# As specified, Python 3.8+ is required.
+# This list is compatible with Python 3.8 and above.
+torch>=2.0.0
+gymnasium>=0.29.0
+numpy>=1.20.0
+pandas>=1.4.0
+faiss-cpu>=1.7.3
+
+# Other necessary libraries used implicitly or explicitly
+scipy>=1.7.3
+
+Explanation of the Requirements:
+ * torch>=2.0.0: This is the deep learning framework your entire model is built on. Your code uses features like torch.nn, torch.optim, and torch.distributions, and you specifically requested a version of 2.0 or higher.
+ * gymnasium>=0.29.0: This is the environment library that your agent interacts with. It has replaced the older gym library, and your code uses its APIs.
+ * faiss-cpu>=1.7.3: This is the library for efficient similarity search and clustering, which you use for your novelty-based fun score. The -cpu variant is specified as it does not require a GPU.
+ * pandas>=1.4.0: Your main.py script uses pandas for data logging and telemetry, so it's an essential dependency for the training loop.
+ * numpy>=1.20.0: Although not explicitly listed in your initial requirements, numpy is a foundational library for scientific computing in Python. It's used heavily by libraries like torch and gymnasium and for data handling within your buffers. It's good practice to include it explicitly.
+ * scipy>=1.7.3: This library is a common dependency for many numerical and scientific packages and is often required by numpy and other components for various low-level functions.
+To set up your environment, you would typically save the above text into a file named requirements.txt and then run:
+pip install -r requirements.txt
+
+This ensures that all the necessary dependencies are installed in your Python environment with the correct version constraints.
