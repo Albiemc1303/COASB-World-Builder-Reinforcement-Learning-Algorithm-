@@ -22,7 +22,6 @@ from caosb_world_model.modules.ppo_actor_critic import PPOActorCritic
 from caosb_world_model.modules.icm import ICMModule
 from caosb_world_model.modules.gan_rehab import WGANRehabModule
 from caosb_world_model.modules.dreamer_generator import DreamerGenerator
-# from caosb_world_model.agents.meta_learner import MetaLearner # Will be imported in main file
 from caosb_world_model.modules.noisy_layers import NoisyLinear
 
 class WorldModelBuilder(nn.Module):
@@ -62,7 +61,6 @@ class WorldModelBuilder(nn.Module):
         self.num_inner_updates = hyperparameters.get('num_inner_updates', 1)
         self.inner_lr = hyperparameters.get('inner_lr', 1e-3)
 
-
         # Core Networks
         self.transformer_encoder = nn.TransformerEncoderLayer(d_model=state_dim, nhead=4, batch_first=True)
         self.encoder = nn.TransformerEncoder(self.transformer_encoder, num_layers=2)
@@ -80,9 +78,6 @@ class WorldModelBuilder(nn.Module):
         self.gan_rehab = WGANRehabModule(state_dim, action_dim, self.critic_iters)
         self.dreamer = DreamerGenerator(state_dim, self.latent_dim)
         
-        # Meta-learner is now an instance, not a module
-        # It needs to be initialized outside of the class, as it's a training loop
-        # We'll use this reference later
         self.meta_learner = None
 
         # Buffers
@@ -251,24 +246,53 @@ class WorldModelBuilder(nn.Module):
         
         return policy_loss + 0.5 * value_loss
 
-    def update_policy(self):
-        """Performs a full PPO update on the policy buffer."""
-        if len(self.policy_buffer) < self.batch_size:
+    def _imagination_rollout(self, start_state, rollout_length=15):
+        """
+        Generates a sequence of imagined states, actions, and rewards.
+        The actions are chosen by the current policy.
+        """
+        imagined_experiences = []
+        current_state_np = start_state.numpy()
+        current_state = start_state.unsqueeze(0)
+        
+        for _ in range(rollout_length):
+            action, log_prob, value, _ = self.get_ppo_action(current_state)
+            
+            # Use the dreamer to predict the next state and reward
+            imagined_next_state, imagined_reward = self.dreamer.predict(current_state_np, action)
+            
+            # Apply symbolic reward to the imagined reward
+            symbolic_reward = self.apply_symbolic_reward(imagined_next_state, action)
+            total_imagined_reward = imagined_reward + symbolic_reward
+
+            # Create an imagined experience and add it to the buffer
+            imagined_exp = Experience(current_state_np, action, total_imagined_reward, imagined_next_state, False, log_prob.item(), value.item())
+            imagined_experiences.append(imagined_exp)
+
+            current_state_np = imagined_next_state
+            current_state = torch.tensor(current_state_np).float().unsqueeze(0)
+
+        return imagined_experiences
+
+    def _update_policy_from_imagination(self, imagined_experiences):
+        """
+        Updates the policy using the PPO loss calculated on imagined experiences.
+        """
+        if not imagined_experiences:
             return 0
         
-        experiences = self.policy_buffer.buffer
-        
         for _ in range(self.ppo_epochs):
-            batch_indices = np.random.choice(len(experiences), self.batch_size, replace=False)
-            batch = [experiences[i] for i in batch_indices]
-            loss = self.get_policy_loss(batch)
-
+            # Using all imagined experiences, as they are synthetic
+            loss = self.get_policy_loss(imagined_experiences)
             self.optimizer_policy.zero_grad()
             loss.backward()
             self.optimizer_policy.step()
 
-        self.policy_buffer.buffer.clear()
         return loss.item()
+
+    def update_policy(self):
+        """This function is now superseded by _update_policy_from_imagination"""
+        return 0
 
     def update_icm(self, batch):
         """Updates the ICM and returns the intrinsic reward."""
@@ -427,72 +451,62 @@ class WorldModelBuilder(nn.Module):
                     symbolic_reward += rule['then']['reward_penalty']
                     
         return symbolic_reward
-
+    
     def train_step(self, env):
-        """Performs a single episode of training."""
+        """
+        Refactored training step:
+        1. Collect a small batch of real-world experience.
+        2. Update the world model components (dreamer, ICM).
+        3. Perform policy updates using imagined rollouts.
+        """
+        
+        # Phase 1: Collect a small amount of real-world experience
+        real_experiences = []
         state, _ = env.reset()
-        state = torch.tensor(state).float()
-        episode_reward = 0
-        episode_rewards = []
         done = False
         step_count = 0
-        
-        hidden = None
-        
-        while not done and step_count < 500:
-            if self.steps % 500 == 0 and self.steps > 0:
-                self.athena_extract()
-            
-            action, log_prob, value, hidden = self.get_ppo_action(state.unsqueeze(0), hidden=hidden)
-            
+        while not done and step_count < 100: # Collect for a short while
+            state_tensor = torch.tensor(state).float().unsqueeze(0)
+            action, _, _, _ = self.get_ppo_action(state_tensor)
             next_state, reward, done, truncated, _ = env.step(action)
-            next_state = torch.tensor(next_state).float()
             done = done or truncated
-
-            state_features, _ = self.encode(state.unsqueeze(0))
-            fun_score = self.compute_fun_score(reward, episode_rewards, state_features)
             
-            features_np = state_features.detach().cpu().numpy().reshape(1, -1)
-            self.faiss_index.add(features_np)
-            self.faiss_features.append(features_np)
+            # Update buffers and extract knowledge from real experiences
+            self.athena_extract()
+            fun_score = self.compute_fun_score(reward, [reward], self.encode(state_tensor)[0])
+            icm_reward = self.update_icm([(state, action, reward, next_state, done, None, None)])
             
-            symbolic_reward = self.apply_symbolic_reward(state.numpy(), action)
-            total_reward = reward + self.alpha_fun * fun_score + symbolic_reward
+            total_reward = reward + self.alpha_fun * fun_score + self.alpha_icm * icm_reward
+            exp = Experience(state, action, total_reward, next_state, done, None, None)
+            self.main_buffer.push(exp)
             
-            icm_reward = self.update_icm([(state.numpy(), action, reward, next_state.numpy(), done, None, None)])
-            total_reward += self.alpha_icm * icm_reward
-
-            exp = Experience(state.numpy(), action, total_reward, next_state.numpy(), done, log_prob, value)
-
-            if reward > 0:
-                self.good_buffer.push(exp)
-            elif reward < 0:
-                self.bad_buffer.push(exp)
-            else:
-                self.main_buffer.push(exp)
-
-            self.policy_buffer.push(exp)
-
-            for idx in range(3):
-                if len(self.main_buffer) > self.batch_size:
-                    batch, indices, weights = self.main_buffer.sample(self.batch_size)
-                    if batch:
-                        loss, td_errors = self.update_q(batch, idx)
-                        self.main_buffer.update_priorities(indices, td_errors)
-            
+            real_experiences.append(exp)
             state = next_state
-            episode_reward += reward
-            episode_rewards.append(reward)
-            self.steps += 1
-            self.eps = self.eps_end + (self.eps_start - self.eps_end) * math.exp(-1. * self.steps / self.eps_decay)
             step_count += 1
+            self.steps += 1
             
-        self.sync_buffers()
-        policy_loss = self.update_policy()
-        self.rehab_experiences()
-        self.dream_generate()
+        # Phase 2: Update the World Model components
+        if len(self.main_buffer) > self.batch_size:
+            batch, indices, _ = self.main_buffer.sample(self.batch_size)
+            self.dreamer.update(batch)
+            for head_idx in range(3):
+                self.update_q(batch, head_idx)
+            self.rehab_experiences()
+            self.dream_generate()
 
-        return {'episode_reward': episode_reward, 'policy_loss': policy_loss}
+        # Phase 3: Train the policy on imagined rollouts
+        # Get a starting state from real experiences to seed the imagination
+        if real_experiences:
+            start_state_np = random.choice(real_experiences).state
+            start_state_tensor = torch.tensor(start_state_np).float()
+            
+            imagined_experiences = self._imagination_rollout(start_state_tensor, rollout_length=50)
+            policy_loss = self._update_policy_from_imagination(imagined_experiences)
+            
+            # The rest of the main training loop is now moved into helper functions or superseded.
+            self.eps = self.eps_end + (self.eps_start - self.eps_end) * math.exp(-1. * self.steps / self.eps_decay)
+        
+        return {'episode_reward': sum([exp.reward for exp in real_experiences]), 'policy_loss': policy_loss}
 
     def save_pics(self, path='checkpoint.pth'):
         state = {
