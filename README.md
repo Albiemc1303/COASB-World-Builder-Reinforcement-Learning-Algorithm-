@@ -1,0 +1,2 @@
+# COASB-World-Builder-Reinforcement-Learning-Algorithm-
+CAOSB(Context Aware Observation and Symbolic Based) World Builder Reinforcement Learning Algorithm, is a novel Learning framework that aims to create an agent that finds the most optimal path to success in training and understanding of the environment through building the perfect model of the environments world and policy, and eliminating Negatives
