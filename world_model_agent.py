@@ -19,10 +19,11 @@ from caosb_world_model.core.experience import Experience
 from caosb_world_model.modules.dueling_dqn_head import DuelingDQNHead
 from caosb_world_model.modules.ppo_actor_critic import PPOActorCritic
 from caosb_world_model.modules.icm import ICMModule
-from caosb_world_model.modules.gan_rehab import GANRehabModule
+# Using the new WGAN-based rehab module
+from caosb_world_model.modules.gan_rehab import WGANRehabModule
 from caosb_world_model.modules.dreamer_generator import DreamerGenerator
 from caosb_world_model.agents.meta_learner import MetaLearner
-from caosb_world_model.modules.noisy_layers import NoisyLinear # Needed for NoisyNet reset
+from caosb_world_model.modules.noisy_layers import NoisyLinear
 
 class WorldModelBuilder(nn.Module):
     """
@@ -52,6 +53,10 @@ class WorldModelBuilder(nn.Module):
         self.eps_end = hyperparameters['eps_end']
         self.eps_decay = hyperparameters['eps_decay']
         
+        # New WGAN hyperparameters
+        self.gan_lr = hyperparameters.get('gan_lr', 1e-4)
+        self.critic_iters = hyperparameters.get('critic_iters', 5)
+
         # Core Networks
         self.transformer_encoder = nn.TransformerEncoderLayer(d_model=state_dim, nhead=4, batch_first=True)
         self.encoder = nn.TransformerEncoder(self.transformer_encoder, num_layers=2)
@@ -66,7 +71,8 @@ class WorldModelBuilder(nn.Module):
             
         self.policy = PPOActorCritic(self.latent_dim, action_dim)
         self.icm = ICMModule(state_dim, action_dim, self.latent_dim)
-        self.gan_rehab = GANRehabModule(state_dim, action_dim)
+        # Using the new WGAN rehab module
+        self.gan_rehab = WGANRehabModule(state_dim, action_dim, self.critic_iters)
         self.dreamer = DreamerGenerator(state_dim, self.latent_dim)
         self.meta_learner = MetaLearner(self)
 
@@ -80,9 +86,10 @@ class WorldModelBuilder(nn.Module):
         self.optimizer_q = optim.Adam(self.q_heads.parameters(), lr=self.lr)
         self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=self.lr)
         self.optimizer_icm = optim.Adam(self.icm.parameters(), lr=self.lr)
-        self.optimizer_gan = optim.Adam(
-            list(self.gan_rehab.parameters()) + list(self.dreamer.parameters()), lr=self.lr
-        )
+        # The GAN optimizer is now only for the generator
+        self.optimizer_gan = optim.Adam(self.gan_rehab.generator.parameters(), lr=self.gan_lr)
+        # The critic gets its own separate optimizer
+        self.optimizer_critic = optim.Adam(self.gan_rehab.critic.parameters(), lr=self.gan_lr)
 
         # Training State
         self.eps = self.eps_start
@@ -264,8 +271,8 @@ class WorldModelBuilder(nn.Module):
         return intrinsic_reward
 
     def rehab_experiences(self):
-        """Rehabilitates 'bad' experiences using the GAN."""
-        if len(self.bad_buffer) < 1 or len(self.good_buffer) < 1 or self.faiss_index.ntotal == 0:
+        """Rehabilitates 'bad' experiences using the WGAN."""
+        if len(self.bad_buffer) < 1 or len(self.good_buffer) < self.batch_size or self.faiss_index.ntotal == 0:
             return
         
         bad_exp = random.choice(self.bad_buffer.buffer)
@@ -285,32 +292,43 @@ class WorldModelBuilder(nn.Module):
         if good_exp is None:
             return
 
-        # Train Discriminator
-        self.optimizer_gan.zero_grad()
-        
-        real_state = torch.tensor(good_exp.state).float()
-        real_action = torch.tensor([good_exp.action]).float()
-        real_reward = torch.tensor([good_exp.reward]).float()
-        real_next_state = torch.tensor(good_exp.next_state).float()
-        real = torch.cat([real_state, real_action, real_reward, real_next_state]).unsqueeze(0)
-        
-        generated = self.gan_rehab.generate(bad_exp).unsqueeze(0)
+        # WGAN training loop: Train the critic multiple times per generator update
+        for _ in range(self.critic_iters):
+            self.optimizer_critic.zero_grad()
+            
+            # Get real and fake experiences
+            real_state = torch.tensor(good_exp.state).float()
+            real_action = torch.tensor([good_exp.action]).float()
+            real_reward = torch.tensor([good_exp.reward]).float()
+            real_next_state = torch.tensor(good_exp.next_state).float()
+            real = torch.cat([real_state, real_action, real_reward, real_next_state]).unsqueeze(0)
+            
+            generated = self.gan_rehab.generate(bad_exp).unsqueeze(0)
 
-        d_real = self.gan_rehab.discriminator(real.detach())
-        d_fake = self.gan_rehab.discriminator(generated.detach())
-        
-        loss_d = -torch.mean(torch.log(d_real + 1e-8) + torch.log(1 - d_fake + 1e-8))
-        loss_d.backward()
-        self.optimizer_gan.step()
-        
-        # Train Generator
+            # Calculate critic losses
+            d_real = self.gan_rehab.critic(real.detach())
+            d_fake = self.gan_rehab.critic(generated.detach())
+            
+            loss_d = d_fake.mean() - d_real.mean()
+            
+            # Backpropagate and clip weights
+            loss_d.backward()
+            self.optimizer_critic.step()
+            for p in self.gan_rehab.critic.parameters():
+                p.data.clamp_(-0.01, 0.01)
+
+        # Train the generator
         self.optimizer_gan.zero_grad()
-        d_fake_g = self.gan_rehab.discriminator(generated)
-        loss_g = -torch.mean(torch.log(d_fake_g + 1e-8))
+        generated = self.gan_rehab.generate(bad_exp).unsqueeze(0)
+        d_fake_g = self.gan_rehab.critic(generated)
+        loss_g = -d_fake_g.mean()
         loss_g.backward()
         self.optimizer_gan.step()
 
-        if d_fake_g.mean().item() > 0.5:
+        # The condition for pushing to the main buffer now depends on the critic output.
+        # If the critic thinks the fake experience is as good as a real one, we push it.
+        # Note: A slightly higher confidence threshold might be needed for stability.
+        if d_fake_g.mean().item() > d_real.mean().item() * 0.9:
             gen_exp_data = generated.squeeze(0).detach().cpu().numpy()
             gen_s = gen_exp_data[0:self.state_dim]
             gen_a = int(gen_exp_data[self.state_dim].round())
