@@ -19,7 +19,6 @@ from caosb_world_model.core.experience import Experience
 from caosb_world_model.modules.dueling_dqn_head import DuelingDQNHead
 from caosb_world_model.modules.ppo_actor_critic import PPOActorCritic
 from caosb_world_model.modules.icm import ICMModule
-# Using the new WGAN-based rehab module
 from caosb_world_model.modules.gan_rehab import WGANRehabModule
 from caosb_world_model.modules.dreamer_generator import DreamerGenerator
 from caosb_world_model.agents.meta_learner import MetaLearner
@@ -71,7 +70,6 @@ class WorldModelBuilder(nn.Module):
             
         self.policy = PPOActorCritic(self.latent_dim, action_dim)
         self.icm = ICMModule(state_dim, action_dim, self.latent_dim)
-        # Using the new WGAN rehab module
         self.gan_rehab = WGANRehabModule(state_dim, action_dim, self.critic_iters)
         self.dreamer = DreamerGenerator(state_dim, self.latent_dim)
         self.meta_learner = MetaLearner(self)
@@ -86,9 +84,7 @@ class WorldModelBuilder(nn.Module):
         self.optimizer_q = optim.Adam(self.q_heads.parameters(), lr=self.lr)
         self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=self.lr)
         self.optimizer_icm = optim.Adam(self.icm.parameters(), lr=self.lr)
-        # The GAN optimizer is now only for the generator
         self.optimizer_gan = optim.Adam(self.gan_rehab.generator.parameters(), lr=self.gan_lr)
-        # The critic gets its own separate optimizer
         self.optimizer_critic = optim.Adam(self.gan_rehab.critic.parameters(), lr=self.gan_lr)
 
         # Training State
@@ -98,7 +94,14 @@ class WorldModelBuilder(nn.Module):
         self.faiss_index = faiss.IndexFlatL2(self.latent_dim)
         self.faiss_features = []
         self.fun_history = deque(maxlen=100)
-        self.symbolic_rep = {}
+        
+        # New: Symbolic knowledge base, a dictionary to store learned rules
+        self.symbolic_knowledge_base = {
+            'rules': [], # A list to hold our learned symbolic rules
+            'dynamics': {},
+            'goals': {}
+        }
+
 
     def encode(self, state, hidden=None):
         """Encodes the state using a Transformer-LSTM model."""
@@ -325,9 +328,6 @@ class WorldModelBuilder(nn.Module):
         loss_g.backward()
         self.optimizer_gan.step()
 
-        # The condition for pushing to the main buffer now depends on the critic output.
-        # If the critic thinks the fake experience is as good as a real one, we push it.
-        # Note: A slightly higher confidence threshold might be needed for stability.
         if d_fake_g.mean().item() > d_real.mean().item() * 0.9:
             gen_exp_data = generated.squeeze(0).detach().cpu().numpy()
             gen_s = gen_exp_data[0:self.state_dim]
@@ -359,6 +359,66 @@ class WorldModelBuilder(nn.Module):
         self.good_buffer.buffer.clear()
         self.bad_buffer.buffer.clear()
 
+    def athena_extract(self):
+        """
+        Analyzes experiences to extract and store symbolic, causal rules.
+        This is an initial, rule-based approach for knowledge extraction.
+        """
+        if len(self.good_buffer) < 1 or len(self.bad_buffer) < 1:
+            return
+
+        # Analyze good experiences to infer successful patterns
+        good_states = np.array([exp.state for exp in self.good_buffer.buffer])
+        good_actions = np.array([exp.action for exp in self.good_buffer.buffer])
+        good_next_states = np.array([exp.next_state for exp in self.good_buffer.buffer])
+        
+        if good_states.shape[0] > 10:
+            y_pos_change = good_next_states[:, 1] - good_states[:, 1]
+            thrust_actions = good_actions == 2
+            
+            if np.mean(y_pos_change[thrust_actions]) > 0.05:
+                rule = {
+                    'if': {'action': 2, 'effect': 'positive_y_velocity'},
+                    'then': {'outcome': 'desirable', 'reward_bonus': 0.5}
+                }
+                if rule not in self.symbolic_knowledge_base['rules']:
+                    self.symbolic_knowledge_base['rules'].append(rule)
+
+        # Analyze bad experiences to infer failure conditions
+        bad_states = np.array([exp.state for exp in self.bad_buffer.buffer])
+        
+        if bad_states.shape[0] > 10:
+            angle_too_large = np.abs(bad_states[:, 4]) > 0.5
+            
+            if np.mean(angle_too_large) > 0.5:
+                rule = {
+                    'if': {'state': 'angle_too_large'},
+                    'then': {'outcome': 'undesirable', 'reward_penalty': -1.0}
+                }
+                if rule not in self.symbolic_knowledge_base['rules']:
+                    self.symbolic_knowledge_base['rules'].append(rule)
+
+    def apply_symbolic_reward(self, current_state, current_action):
+        """
+        Uses the learned symbolic knowledge to provide an additional reward signal.
+        """
+        symbolic_reward = 0.0
+        for rule in self.symbolic_knowledge_base['rules']:
+            # Check for action-based rules
+            if 'action' in rule['if'] and rule['if']['action'] == current_action:
+                if rule['then']['outcome'] == 'desirable':
+                    symbolic_reward += rule['then']['reward_bonus']
+                elif rule['then']['outcome'] == 'undesirable':
+                    symbolic_reward += rule['then']['reward_penalty']
+        
+        # Add state-based rules
+        for rule in self.symbolic_knowledge_base['rules']:
+            if 'state' in rule['if'] and rule['if']['state'] == 'angle_too_large':
+                if np.abs(current_state[4]) > 0.5:
+                    symbolic_reward += rule['then']['reward_penalty']
+                    
+        return symbolic_reward
+
     def train_step(self, env):
         """Performs a single episode of training."""
         state, _ = env.reset()
@@ -371,7 +431,10 @@ class WorldModelBuilder(nn.Module):
         hidden = None
         
         while not done and step_count < 500:
-            # Use PPO for action selection during training
+            # New: Call athena_extract periodically to learn new rules
+            if self.steps % 500 == 0 and self.steps > 0:
+                self.athena_extract()
+            
             action, log_prob, value, hidden = self.get_ppo_action(state.unsqueeze(0), hidden=hidden)
             
             next_state, reward, done, truncated, _ = env.step(action)
@@ -385,7 +448,10 @@ class WorldModelBuilder(nn.Module):
             self.faiss_index.add(features_np)
             self.faiss_features.append(features_np)
             
-            total_reward = reward + self.alpha_fun * fun_score
+            # New: Use symbolic knowledge to shape the reward
+            symbolic_reward = self.apply_symbolic_reward(state.numpy(), action)
+            total_reward = reward + self.alpha_fun * fun_score + symbolic_reward
+            
             icm_reward = self.update_icm([(state.numpy(), action, reward, next_state.numpy(), done, None, None)])
             total_reward += self.alpha_icm * icm_reward
 
@@ -421,13 +487,6 @@ class WorldModelBuilder(nn.Module):
 
         return {'episode_reward': episode_reward, 'policy_loss': policy_loss}
 
-    def athena_extract(self, env):
-        self.symbolic_rep = {
-            'dynamics': 'y_{t+1} = y_t + vy_t * dt - 0.5 * gravity * dt^2',
-            'goal': 'land on pad with |x|<0.1, |vy|<0.3, legs grounded',
-            'gravity': -10.0
-        }
-
     def save_pics(self, path='checkpoint.pth'):
         state = {
             'model_state': self.state_dict(),
@@ -440,7 +499,7 @@ class WorldModelBuilder(nn.Module):
             },
             'archive': self.archive,
             'steps': self.steps,
-            'symbolic': self.symbolic_rep,
+            'symbolic_knowledge_base': self.symbolic_knowledge_base,
             'faiss_features': self.faiss_features
         }
         torch.save(state, path)
@@ -456,7 +515,9 @@ class WorldModelBuilder(nn.Module):
             self.policy_buffer = pickle.loads(state['buffers']['policy'])
             self.archive = state['archive']
             self.steps = state['steps']
-            self.symbolic_rep = state['symbolic']
+            self.symbolic_knowledge_base = state.get('symbolic_knowledge_base', {
+                'rules': [], 'dynamics': {}, 'goals': {}
+            })
             self.faiss_features = state['faiss_features']
             
             self.faiss_index = faiss.IndexFlatL2(self.latent_dim)
