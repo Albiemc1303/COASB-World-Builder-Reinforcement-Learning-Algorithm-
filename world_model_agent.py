@@ -12,6 +12,7 @@ import math
 import pickle
 import os
 import pandas as pd
+import copy
 
 # Import all the refactored modules
 from caosb_world_model.core.buffers import ExperienceReplayBuffer
@@ -21,7 +22,7 @@ from caosb_world_model.modules.ppo_actor_critic import PPOActorCritic
 from caosb_world_model.modules.icm import ICMModule
 from caosb_world_model.modules.gan_rehab import WGANRehabModule
 from caosb_world_model.modules.dreamer_generator import DreamerGenerator
-from caosb_world_model.agents.meta_learner import MetaLearner
+# from caosb_world_model.agents.meta_learner import MetaLearner # Will be imported in main file
 from caosb_world_model.modules.noisy_layers import NoisyLinear
 
 class WorldModelBuilder(nn.Module):
@@ -55,6 +56,12 @@ class WorldModelBuilder(nn.Module):
         # New WGAN hyperparameters
         self.gan_lr = hyperparameters.get('gan_lr', 1e-4)
         self.critic_iters = hyperparameters.get('critic_iters', 5)
+        
+        # New MAML hyperparameters
+        self.meta_lr = hyperparameters.get('meta_lr', 1e-5)
+        self.num_inner_updates = hyperparameters.get('num_inner_updates', 1)
+        self.inner_lr = hyperparameters.get('inner_lr', 1e-3)
+
 
         # Core Networks
         self.transformer_encoder = nn.TransformerEncoderLayer(d_model=state_dim, nhead=4, batch_first=True)
@@ -72,7 +79,11 @@ class WorldModelBuilder(nn.Module):
         self.icm = ICMModule(state_dim, action_dim, self.latent_dim)
         self.gan_rehab = WGANRehabModule(state_dim, action_dim, self.critic_iters)
         self.dreamer = DreamerGenerator(state_dim, self.latent_dim)
-        self.meta_learner = MetaLearner(self)
+        
+        # Meta-learner is now an instance, not a module
+        # It needs to be initialized outside of the class, as it's a training loop
+        # We'll use this reference later
+        self.meta_learner = None
 
         # Buffers
         self.main_buffer = ExperienceReplayBuffer(hyperparameters['buffer_capacity'], prioritized=True)
@@ -90,14 +101,13 @@ class WorldModelBuilder(nn.Module):
         # Training State
         self.eps = self.eps_start
         self.steps = 0
-        self.archive = {}  # Model archive
+        self.archive = {}
         self.faiss_index = faiss.IndexFlatL2(self.latent_dim)
         self.faiss_features = []
         self.fun_history = deque(maxlen=100)
         
-        # New: Symbolic knowledge base, a dictionary to store learned rules
         self.symbolic_knowledge_base = {
-            'rules': [], # A list to hold our learned symbolic rules
+            'rules': [],
             'dynamics': {},
             'goals': {}
         }
@@ -194,25 +204,25 @@ class WorldModelBuilder(nn.Module):
 
         return loss.item(), (target - q_values).abs().detach().cpu().numpy()
 
-    def update_policy(self):
-        """Performs a full PPO update on the policy buffer."""
-        if len(self.policy_buffer) < self.batch_size:
-            return 0
+    def get_policy_loss(self, experiences):
+        """
+        Calculates the PPO policy and value loss for a batch of experiences.
+        Used by the MetaLearner for the inner loop.
+        """
+        states, actions, rewards, _, dones, log_probs, values = zip(*experiences)
         
-        states, actions, rewards, next_states, dones, log_probs, values = zip(*self.policy_buffer.buffer)
         states = torch.stack([torch.from_numpy(s) for s in states]).float()
         actions = torch.tensor(actions).long()
         rewards = torch.tensor(rewards).float()
         dones = torch.tensor(dones).float()
         old_log_probs = torch.tensor(log_probs).float()
         old_values = torch.tensor(values).float()
-        
+
         returns = torch.zeros_like(rewards)
         advantages = torch.zeros_like(rewards)
         last_gae_lambda = 0.0
-        
+
         with torch.no_grad():
-            # Correct and more standard GAE calculation
             for t in reversed(range(len(rewards))):
                 if t == len(rewards) - 1:
                     next_non_terminal = 1.0 - dones[t]
@@ -227,27 +237,32 @@ class WorldModelBuilder(nn.Module):
                 returns[t] = advantages[t] + old_values[t]
         
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        features, _ = self.encode(states)
+        probs, values = self.policy(features)
+        dist = Categorical(probs)
+        log_probs = dist.log_prob(actions)
+        
+        ratio = torch.exp(log_probs - old_log_probs)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1 - self.ppo_clip, 1 + self.ppo_clip) * advantages
+        policy_loss = -torch.min(surr1, surr2).mean()
+        value_loss = nn.MSELoss()(values.squeeze(-1), returns)
+        
+        return policy_loss + 0.5 * value_loss
 
+    def update_policy(self):
+        """Performs a full PPO update on the policy buffer."""
+        if len(self.policy_buffer) < self.batch_size:
+            return 0
+        
+        experiences = self.policy_buffer.buffer
+        
         for _ in range(self.ppo_epochs):
-            batch_indices = np.random.choice(len(self.policy_buffer), self.batch_size, replace=False)
-            b_states = states[batch_indices]
-            b_actions = actions[batch_indices]
-            b_advantages = advantages[batch_indices]
-            b_returns = returns[batch_indices]
-            b_old_log_probs = old_log_probs[batch_indices]
+            batch_indices = np.random.choice(len(experiences), self.batch_size, replace=False)
+            batch = [experiences[i] for i in batch_indices]
+            loss = self.get_policy_loss(batch)
 
-            b_features, _ = self.encode(b_states)
-            probs, values = self.policy(b_features)
-            dist = Categorical(probs)
-            log_probs = dist.log_prob(b_actions)
-            
-            ratio = torch.exp(log_probs - b_old_log_probs)
-            surr1 = ratio * b_advantages
-            surr2 = torch.clamp(ratio, 1 - self.ppo_clip, 1 + self.ppo_clip) * b_advantages
-            policy_loss = -torch.min(surr1, surr2).mean()
-            value_loss = nn.MSELoss()(values.squeeze(-1), b_returns)
-            
-            loss = policy_loss + 0.5 * value_loss
             self.optimizer_policy.zero_grad()
             loss.backward()
             self.optimizer_policy.step()
@@ -295,11 +310,9 @@ class WorldModelBuilder(nn.Module):
         if good_exp is None:
             return
 
-        # WGAN training loop: Train the critic multiple times per generator update
         for _ in range(self.critic_iters):
             self.optimizer_critic.zero_grad()
             
-            # Get real and fake experiences
             real_state = torch.tensor(good_exp.state).float()
             real_action = torch.tensor([good_exp.action]).float()
             real_reward = torch.tensor([good_exp.reward]).float()
@@ -308,19 +321,16 @@ class WorldModelBuilder(nn.Module):
             
             generated = self.gan_rehab.generate(bad_exp).unsqueeze(0)
 
-            # Calculate critic losses
             d_real = self.gan_rehab.critic(real.detach())
             d_fake = self.gan_rehab.critic(generated.detach())
             
             loss_d = d_fake.mean() - d_real.mean()
             
-            # Backpropagate and clip weights
             loss_d.backward()
             self.optimizer_critic.step()
             for p in self.gan_rehab.critic.parameters():
                 p.data.clamp_(-0.01, 0.01)
 
-        # Train the generator
         self.optimizer_gan.zero_grad()
         generated = self.gan_rehab.generate(bad_exp).unsqueeze(0)
         d_fake_g = self.gan_rehab.critic(generated)
@@ -358,16 +368,18 @@ class WorldModelBuilder(nn.Module):
             self.main_buffer.push(exp, priority=0.5)
         self.good_buffer.buffer.clear()
         self.bad_buffer.buffer.clear()
+        
+    def clone(self):
+        """Creates a deep copy of the agent for the inner loop."""
+        return copy.deepcopy(self)
 
     def athena_extract(self):
         """
         Analyzes experiences to extract and store symbolic, causal rules.
-        This is an initial, rule-based approach for knowledge extraction.
         """
         if len(self.good_buffer) < 1 or len(self.bad_buffer) < 1:
             return
 
-        # Analyze good experiences to infer successful patterns
         good_states = np.array([exp.state for exp in self.good_buffer.buffer])
         good_actions = np.array([exp.action for exp in self.good_buffer.buffer])
         good_next_states = np.array([exp.next_state for exp in self.good_buffer.buffer])
@@ -384,7 +396,6 @@ class WorldModelBuilder(nn.Module):
                 if rule not in self.symbolic_knowledge_base['rules']:
                     self.symbolic_knowledge_base['rules'].append(rule)
 
-        # Analyze bad experiences to infer failure conditions
         bad_states = np.array([exp.state for exp in self.bad_buffer.buffer])
         
         if bad_states.shape[0] > 10:
@@ -404,14 +415,12 @@ class WorldModelBuilder(nn.Module):
         """
         symbolic_reward = 0.0
         for rule in self.symbolic_knowledge_base['rules']:
-            # Check for action-based rules
             if 'action' in rule['if'] and rule['if']['action'] == current_action:
                 if rule['then']['outcome'] == 'desirable':
                     symbolic_reward += rule['then']['reward_bonus']
                 elif rule['then']['outcome'] == 'undesirable':
                     symbolic_reward += rule['then']['reward_penalty']
         
-        # Add state-based rules
         for rule in self.symbolic_knowledge_base['rules']:
             if 'state' in rule['if'] and rule['if']['state'] == 'angle_too_large':
                 if np.abs(current_state[4]) > 0.5:
@@ -431,7 +440,6 @@ class WorldModelBuilder(nn.Module):
         hidden = None
         
         while not done and step_count < 500:
-            # New: Call athena_extract periodically to learn new rules
             if self.steps % 500 == 0 and self.steps > 0:
                 self.athena_extract()
             
@@ -448,7 +456,6 @@ class WorldModelBuilder(nn.Module):
             self.faiss_index.add(features_np)
             self.faiss_features.append(features_np)
             
-            # New: Use symbolic knowledge to shape the reward
             symbolic_reward = self.apply_symbolic_reward(state.numpy(), action)
             total_reward = reward + self.alpha_fun * fun_score + symbolic_reward
             
