@@ -1,98 +1,119 @@
 # main.py
 
-import gymnasium as gym
-import torch
-import pandas as pd
 import os
-
-# Import the core components
-from caosb_world_model.environments.shaped_lunar_lander import ShapedLunarLander
+import gym
+import torch
+import numpy as np
 from caosb_world_model.agents.world_model_agent import WorldModelBuilder
+from caosb_world_model.agents.meta_learner import MetaLearner
+from caosb_world_model.core.experience import Experience
 
-# Define Hyperparameters in a single dictionary
+# --- Hyperparameters ---
 HYPERPARAMETERS = {
-    # Environment
-    'state_dim': 8,
-    'action_dim': 4,
-    
-    # Core Agent
-    'latent_dim': 64,
-    'buffer_capacity': 1000000,
-    'batch_size': 64,
+    'latent_dim': 128,
     'gamma': 0.99,
     'tau': 0.005,
-    'lr': 0.001,
-    'eps_start': 1.0,
-    'eps_end': 0.01,
-    'eps_decay': 0.995,
+    'lr': 1e-4,
+    'meta_lr': 1e-5,  # New: learning rate for meta-update
+    'inner_lr': 1e-3, # New: learning rate for inner adaptation
+    'num_inner_updates': 1, # New: number of gradient steps in inner loop
     'alpha_fun': 0.1,
     'alpha_icm': 0.1,
-    
-    # PPO
     'ppo_epochs': 4,
     'ppo_clip': 0.2,
     'ppo_lambda': 0.95,
+    'buffer_capacity': 100000,
+    'batch_size': 64,
+    'eps_start': 0.9,
+    'eps_end': 0.05,
+    'eps_decay': 1000,
+    'critic_iters': 5,
+    'gan_lr': 1e-4
 }
 
+# --- Task Generation ---
+def create_task_env(gravity_modifier=1.0, main_engine_power_modifier=1.0):
+    """
+    Creates a LunarLander environment with modified physical parameters.
+    This defines a 'task' for our meta-learning.
+    """
+    env = gym.make("LunarLander-v2", new_step_api=True)
+    env.gravity *= gravity_modifier
+    env.main_engine_power *= main_engine_power_modifier
+    return env
+
+def get_task_experiences(env, agent, num_episodes=5):
+    """
+    Runs episodes in a given environment to collect a batch of experiences.
+    """
+    experiences = []
+    
+    for _ in range(num_episodes):
+        state, _ = env.reset()
+        done = False
+        hidden = None
+        while not done:
+            state_tensor = torch.tensor(state).float().unsqueeze(0)
+            action, log_prob, value, hidden = agent.get_ppo_action(state_tensor, hidden=hidden)
+            next_state, reward, done, truncated, info = env.step(action)
+            done = done or truncated
+            
+            exp = Experience(state, action, reward, next_state, done, log_prob, value)
+            experiences.append(exp)
+            state = next_state
+            
+    return experiences
+
+# --- Main Training Loop ---
 def main():
-    """
-    Main training function for the CAOSB-World Model.
-    """
-    # 1. Setup Environment and Agent
-    print("Setting up the environment and agent...")
-    env = ShapedLunarLander(gym.make("LunarLander-v2"))
-    agent = WorldModelBuilder(HYPERPARAMETERS['state_dim'], HYPERPARAMETERS['action_dim'], HYPERPARAMETERS)
-    agent.athena_extract(env)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
-    # 2. Setup Logging and Telemetry
-    print("Initializing logging...")
-    log_df = pd.DataFrame(columns=['episode', 'reward'])
-    telemetry = []
-
-    # 3. Main Training Loop
-    print("Starting training...")
-    for episode in range(1000):
-        # Perform a single training step (one full episode)
-        metrics = agent.train_step(env)
-        
-        # Log episode results
-        log_df = pd.concat([log_df, pd.DataFrame({'episode': [episode], 'reward': [metrics['episode_reward']]})], ignore_index=True)
-        log_df.to_csv('training_logs.csv', index=False)
-        
-        # Log telemetry data (e.g., losses)
-        telemetry.append({'episode': episode, 'q_loss': 0, 'policy_loss': metrics['policy_loss']})
-        pd.DataFrame(telemetry).to_csv('telemetry.csv', index=False)
-        
-        print(f"Episode {episode}: Reward {metrics['episode_reward']:.2f}, Policy Loss {metrics['policy_loss']:.4f}")
-        
-        # 4. Checkpointing and Archiving
-        if episode > 0 and episode % 100 == 0:
-            checkpoint_path = f'checkpoint_{episode}.pth'
-            print(f"Saving checkpoint to {checkpoint_path}")
-            agent.save_pics(checkpoint_path)
-            # Archiving the model state for later analysis
-            agent.archive[f'model_{episode}'] = agent.state_dict()
-        
-        # 5. Curriculum Learning
-        if metrics['episode_reward'] > 100 and env.stage < 3:
-            env.stage += 1
-            print(f"Advancing to curriculum stage {env.stage}")
-
-    env.close()
-    print("Training complete.")
-
-if __name__ == '__main__':
-    # Ensure the directory structure exists
-    os.makedirs('caosb_world_model/agents', exist_ok=True)
-    os.makedirs('caosb_world_model/core', exist_ok=True)
-    os.makedirs('caosb_world_model/modules', exist_ok=True)
-    os.makedirs('caosb_world_model/environments', exist_ok=True)
+    # Initialize main agent
+    env = gym.make("LunarLander-v2")
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+    agent = WorldModelBuilder(state_dim, action_dim, HYPERPARAMETERS).to(device)
     
-    # Create the __init__.py files
-    with open('caosb_world_model/__init__.py', 'w') as f: pass
-    with open('caosb_world_model/agents/__init__.py', 'w') as f: pass
-    with open('caosb_world_model/core/__init__.py', 'w') as f: pass
-    with open('caosb_world_model/modules/__init__.py', 'w') as f: pass
-    with open('caosb_world_model/environments/__init__.py', 'w') as f: pass
+    # Initialize meta-learner
+    meta_learner = MetaLearner(agent, meta_lr=HYPERPARAMETERS['meta_lr'])
+
+    num_meta_epochs = 100
+    tasks_per_batch = 5
     
+    for meta_epoch in range(num_meta_epochs):
+        print(f"--- Starting Meta-Epoch {meta_epoch + 1}/{num_meta_epochs} ---")
+        
+        task_batch = []
+        # Step 1: Create a batch of diverse tasks
+        for _ in range(tasks_per_batch):
+            # Define a random task by varying gravity and engine power
+            gravity_mod = np.random.uniform(0.8, 1.2)
+            engine_mod = np.random.uniform(0.8, 1.2)
+            task_env = create_task_env(gravity_mod, engine_mod)
+            task_batch.append(task_env)
+        
+        # Step 2: Perform the meta-training step
+        meta_learner.meta_train(task_batch)
+        
+        # Step 3: Evaluate the original agent's performance on a held-out task
+        eval_env = create_task_env(gravity_modifier=1.0, main_engine_power_modifier=1.0)
+        eval_reward = 0
+        state, _ = eval_env.reset()
+        done = False
+        while not done:
+            state_tensor = torch.tensor(state).float().unsqueeze(0).to(device)
+            action, _, _, _ = agent.select_action(state_tensor)
+            next_state, reward, done, truncated, _ = eval_env.step(action)
+            done = done or truncated
+            eval_reward += reward
+            state = next_state
+        
+        print(f"Evaluation Reward (standard task): {eval_reward}")
+
+    # You would typically save the final meta-learned agent here
+    agent.save_pics("final_meta_agent.pth")
+    print("Meta-training complete. Agent saved.")
+
+if __name__ == "__main__":
     main()
