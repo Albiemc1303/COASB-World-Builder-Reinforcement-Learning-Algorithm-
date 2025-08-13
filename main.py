@@ -1,12 +1,12 @@
 # main.py
 
 import os
-import gym
+import gymnasium as gym
 import torch
 import numpy as np
-from caosb_world_model.agents.world_model_agent import WorldModelBuilder
-from caosb_world_model.agents.meta_learner import MetaLearner
-from caosb_world_model.core.experience import Experience
+from world_model_agent import WorldModelBuilder
+from meta_learner import MetaLearner
+from experience import Experience
 
 # --- Hyperparameters ---
 HYPERPARAMETERS = {
@@ -37,9 +37,9 @@ def create_task_env(gravity_modifier=1.0, main_engine_power_modifier=1.0):
     Creates a LunarLander environment with modified physical parameters.
     This defines a 'task' for our meta-learning.
     """
-    env = gym.make("LunarLander-v2", new_step_api=True)
-    env.gravity *= gravity_modifier
-    env.main_engine_power *= main_engine_power_modifier
+    env = gym.make("LunarLander-v3")
+    env.unwrapped.gravity *= gravity_modifier
+    env.unwrapped.main_engine_power *= main_engine_power_modifier
     return env
 
 def get_task_experiences(env, agent, num_episodes=5):
@@ -70,7 +70,7 @@ def main():
     print(f"Using device: {device}")
     
     # Initialize main agent
-    env = gym.make("LunarLander-v2")
+    env = gym.make("LunarLander-v3")
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
     agent = WorldModelBuilder(state_dim, action_dim, HYPERPARAMETERS).to(device)
@@ -111,7 +111,6 @@ def main():
         
         print(f"Evaluation Reward (standard task): {eval_reward}")
 
-    # You would typically save the final meta-learned agent here
     agent.save_pics("final_meta_agent.pth")
     print("Meta-training complete. Agent saved.")
 
