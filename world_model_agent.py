@@ -23,6 +23,7 @@ from icm import ICMModule
 from gan_rehab import WGANRehabModule
 from dreamer_generator import DreamerGenerator
 from noisy_layers import NoisyLinear
+from symbolic_planner import SymbolicPlanner
 
 class WorldModelBuilder(nn.Module):
     """
@@ -100,6 +101,19 @@ class WorldModelBuilder(nn.Module):
         self.faiss_index = faiss.IndexFlatL2(self.latent_dim)
         self.faiss_features = []
         self.fun_history = deque(maxlen=100)
+        # We will add a new Symbolic Planner module here
+        self.planner = SymbolicPlanner()
+        self.current_plan = []
+        self.current_sub_goal = None
+
+        # New Reward Shaping Hyperparameters for Acrobot
+        self.reward_shaping_params = {
+            'gamma': self.gamma,
+            'lambda_height': 1.0,
+            'alpha_action_cost': 0.01,
+            'xi_velocity_penalty': 0.05,
+            'plan_bonus': 5.0 # New: a large bonus for following a sub-goal
+        }
         
         self.symbolic_knowledge_base = {
             'rules': [],
@@ -148,6 +162,8 @@ class WorldModelBuilder(nn.Module):
             q_values = self.q_heads[0](features)
         action = q_values.argmax().item()
         return action, hidden
+
+    
 
     def compute_fun_score(self, reward, episode_rewards, state_features):
         """Calculates a fun score based on novelty, streaks, and mastery."""
