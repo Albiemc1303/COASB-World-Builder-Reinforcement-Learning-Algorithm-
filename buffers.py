@@ -3,7 +3,7 @@
 import numpy as np
 import random
 from collections import deque
-from caosb_world_model.core.experience import Experience
+from experience import Experience
 
 class ExperienceReplayBuffer:
     """
