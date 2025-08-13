@@ -14,9 +14,9 @@ HYPERPARAMETERS = {
     'gamma': 0.99,
     'tau': 0.005,
     'lr': 1e-4,
-    'meta_lr': 1e-5,  # New: learning rate for meta-update
-    'inner_lr': 1e-3, # New: learning rate for inner adaptation
-    'num_inner_updates': 1, # New: number of gradient steps in inner loop
+    'meta_lr': 1e-5,
+    'inner_lr': 1e-3,
+    'num_inner_updates': 1,
     'alpha_fun': 0.1,
     'alpha_icm': 0.1,
     'ppo_epochs': 4,
@@ -31,16 +31,31 @@ HYPERPARAMETERS = {
     'gan_lr': 1e-4
 }
 
-# --- Task Generation ---
-def create_task_env(gravity_modifier=1.0, main_engine_power_modifier=1.0):
+# --- Task Generation for Acrobot ---
+def create_task_env(start_range=0.1):
     """
-    Creates a LunarLander environment with modified physical parameters.
-    This defines a 'task' for our meta-learning.
+    Creates an Acrobot environment with a modified starting state range.
+    This defines a 'task' for meta-learning.
     """
-    env = gym.make("LunarLander-v3")
-    env.unwrapped.gravity *= gravity_modifier
-    env.unwrapped.main_engine_power *= main_engine_power_modifier
-    return env
+    env = gym.make("Acrobot-v1")
+    
+    # We will wrap the environment to modify the initial state
+    class AcrobotTaskWrapper(gym.Wrapper):
+        def __init__(self, env, start_range):
+            super().__init__(env)
+            self.start_range = start_range
+
+        def reset(self, **kwargs):
+            # Resetting with a specific range for the initial state
+            high = np.array([self.start_range, self.start_range, self.start_range, self.start_range, self.start_range, self.start_range])
+            low = -high
+            self.unwrapped.state = self.unwrapped.np_random.uniform(low=low, high=high)
+            
+            # The base env.reset() returns a tuple (observation, info)
+            return self.env.unwrapped._get_obs(), {}
+
+    return AcrobotTaskWrapper(env, start_range)
+
 
 def get_task_experiences(env, agent, num_episodes=5):
     """
@@ -64,15 +79,16 @@ def get_task_experiences(env, agent, num_episodes=5):
             
     return experiences
 
+
 # --- Main Training Loop ---
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     # Initialize main agent
-    env = gym.make("LunarLander-v3")
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
+    env = gym.make("Acrobot-v1")
+    state_dim = env.observation_space.shape[0]  # 6
+    action_dim = env.action_space.n           # 3
     agent = WorldModelBuilder(state_dim, action_dim, HYPERPARAMETERS).to(device)
     
     # Initialize meta-learner
@@ -85,19 +101,17 @@ def main():
         print(f"--- Starting Meta-Epoch {meta_epoch + 1}/{num_meta_epochs} ---")
         
         task_batch = []
-        # Step 1: Create a batch of diverse tasks
+        # Step 1: Create a batch of diverse tasks by varying the starting state range
         for _ in range(tasks_per_batch):
-            # Define a random task by varying gravity and engine power
-            gravity_mod = np.random.uniform(0.8, 1.2)
-            engine_mod = np.random.uniform(0.8, 1.2)
-            task_env = create_task_env(gravity_mod, engine_mod)
+            start_range_mod = np.random.uniform(0.01, 0.3)
+            task_env = create_task_env(start_range_mod)
             task_batch.append(task_env)
         
         # Step 2: Perform the meta-training step
         meta_learner.meta_train(task_batch)
         
-        # Step 3: Evaluate the original agent's performance on a held-out task
-        eval_env = create_task_env(gravity_modifier=1.0, main_engine_power_modifier=1.0)
+        # Step 3: Evaluate the original agent's performance on a standard task
+        eval_env = gym.make("Acrobot-v1")
         eval_reward = 0
         state, _ = eval_env.reset()
         done = False
@@ -111,7 +125,7 @@ def main():
         
         print(f"Evaluation Reward (standard task): {eval_reward}")
 
-    agent.save_pics("final_meta_agent.pth")
+    agent.save_pics("final_acrobot_meta_agent.pth")
     print("Meta-training complete. Agent saved.")
 
 if __name__ == "__main__":
