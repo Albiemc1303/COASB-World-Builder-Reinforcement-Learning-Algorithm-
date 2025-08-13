@@ -11,8 +11,8 @@ import faiss
 import math
 import pickle
 import os
-import pandas as pd
 import copy
+import gymnasium as gym
 
 # Import all the refactored modules
 from buffers import ExperienceReplayBuffer
@@ -31,7 +31,8 @@ class WorldModelBuilder(nn.Module):
     to perform curriculum-based reinforcement learning.
 
     This class handles state encoding, action selection, training updates for
-    DQN, PPO, ICM, GAN, and manages the various replay buffers.
+    DQN, PPO, ICM, GAN, and manages the various replay buffers. It now
+    also integrates a SymbolicPlanner for high-level goal-oriented control.
     """
     def __init__(self, state_dim, action_dim, hyperparameters):
         super().__init__()
@@ -61,6 +62,17 @@ class WorldModelBuilder(nn.Module):
         self.meta_lr = hyperparameters.get('meta_lr', 1e-5)
         self.num_inner_updates = hyperparameters.get('num_inner_updates', 1)
         self.inner_lr = hyperparameters.get('inner_lr', 1e-3)
+        
+        # New Reward Shaping Hyperparameters for Acrobot
+        self.reward_shaping_params = {
+            'gamma': self.gamma,
+            'lambda_height': 1.0,
+            'alpha_action_cost': 0.01,
+            'xi_velocity_penalty': 0.05,
+            'plan_bonus': 5.0,
+            'athena_bonus': 2.0,  # New bonus from Athena rules
+            'athena_penalty': -2.0 # New penalty from Athena rules
+        }
 
         # Core Networks
         self.transformer_encoder = nn.TransformerEncoderLayer(d_model=state_dim, nhead=4, batch_first=True)
@@ -101,27 +113,13 @@ class WorldModelBuilder(nn.Module):
         self.faiss_index = faiss.IndexFlatL2(self.latent_dim)
         self.faiss_features = []
         self.fun_history = deque(maxlen=100)
-        # We will add a new Symbolic Planner module here
+        
+        # Symbolic Planner and Knowledge Base
         self.planner = SymbolicPlanner()
-        self.current_plan = []
-        self.current_sub_goal = None
-
-        # New Reward Shaping Hyperparameters for Acrobot
-        self.reward_shaping_params = {
-            'gamma': self.gamma,
-            'lambda_height': 1.0,
-            'alpha_action_cost': 0.01,
-            'xi_velocity_penalty': 0.05,
-            'plan_bonus': 5.0 # New: a large bonus for following a sub-goal
+        self.symbolic_knowledge_base = {
+            'rules': []
         }
         
-        self.symbolic_knowledge_base = {
-            'rules': [],
-            'dynamics': {},
-            'goals': {}
-        }
-
-
     def encode(self, state, hidden=None):
         """Encodes the state using a Transformer-LSTM model."""
         batch_size = state.size(0)
@@ -136,7 +134,7 @@ class WorldModelBuilder(nn.Module):
     def get_ppo_action(self, state, hidden=None):
         """
         Selects an action using the PPO policy and returns all necessary data
-        for training.
+        for training. This version is for un-guided action selection.
         """
         features, hidden = self.encode(state, hidden)
         with torch.no_grad():
@@ -163,7 +161,22 @@ class WorldModelBuilder(nn.Module):
         action = q_values.argmax().item()
         return action, hidden
 
-    
+    def _select_guided_action(self, state, guidance):
+        """
+        Selects an action by biasing the policy towards the planner's guidance.
+        """
+        features, hidden = self.encode(state.unsqueeze(0))
+        with torch.no_grad():
+            probs, value = self.policy(features)
+        
+        biased_probs = probs + torch.tensor(guidance, device=probs.device).float() * 0.5
+        biased_probs = torch.softmax(biased_probs, dim=-1)
+        
+        dist = Categorical(biased_probs)
+        action = dist.sample().item()
+        log_prob = dist.log_prob(torch.tensor(action, device=probs.device))
+        
+        return action, log_prob, value.squeeze(0), hidden
 
     def compute_fun_score(self, reward, episode_rewards, state_features):
         """Calculates a fun score based on novelty, streaks, and mastery."""
@@ -185,7 +198,51 @@ class WorldModelBuilder(nn.Module):
         self.fun_history.append(reward)
         return fun * dopamine
         
+    def _get_potential(self, state):
+        """
+        Computes the potential function for Acrobot, based on height.
+        state is a numpy array.
+        """
+        if state is None:
+            return 0
+        cos_theta1, sin_theta1, cos_theta2, sin_theta2, _, _ = state
+        return -cos_theta1 - cos_theta1 * cos_theta2 + sin_theta1 * sin_theta2
 
+    def compute_shaped_reward(self, r_orig, current_state, next_state, action):
+        """
+        Computes a new, shaped reward based on the provided comprehensive suite.
+        Uses a combination of potential-based and direct shaping, now
+        including a bonus for following the symbolic plan and Athena's rules.
+        """
+        r_shaped = r_orig
+
+        # 1. Height-Based Potential Shaping (ensures policy invariance)
+        potential_s = self._get_potential(current_state)
+        potential_s_prime = self._get_potential(next_state)
+        r_potential = self.reward_shaping_params['gamma'] * potential_s_prime - potential_s
+        r_shaped += r_potential * self.reward_shaping_params['lambda_height']
+
+        # 2. Action Cost Penalty (a direct, non-potential shaping)
+        r_action_cost = -self.reward_shaping_params['alpha_action_cost'] * abs(action - 1)
+        r_shaped += r_action_cost
+
+        # 3. Stability Penalty Near Goal (based on angular velocities at high height)
+        if next_state[0] < -0.8:
+            omega1_sq = next_state[4] ** 2
+            omega2_sq = next_state[5] ** 2
+            r_stability = -self.reward_shaping_params['xi_velocity_penalty'] * (omega1_sq + omega2_sq)
+            r_shaped += r_stability
+
+        # 4. Symbolic Plan Bonus
+        if self.planner.check_sub_goal(next_state):
+             r_shaped += self.reward_shaping_params['plan_bonus']
+             self.planner.advance_sub_goal()
+        
+        # 5. Athena Symbolic Reward (New)
+        r_shaped += self.apply_symbolic_reward(next_state, action)
+        
+        return r_shaped
+        
     def update_q(self, batch, head_idx):
         """Updates one of the Q-networks using Double DQN and PER."""
         states, actions, rewards, next_states, dones, _, _ = zip(*batch)
@@ -266,28 +323,25 @@ class WorldModelBuilder(nn.Module):
     def _imagination_rollout(self, start_state, rollout_length=15):
         """
         Generates a sequence of imagined states, actions, and rewards.
-        The actions are chosen by the current policy.
+        This rollout is now also guided by the planner's sub-goals.
         """
         imagined_experiences = []
         current_state_np = start_state.numpy()
-        current_state = start_state.unsqueeze(0)
+        
+        self.planner.current_sub_goal_idx = 0 
         
         for _ in range(rollout_length):
-            action, log_prob, value, _ = self.get_ppo_action(current_state)
-            
-            # Use the dreamer to predict the next state and reward
+            guidance = self.planner.provide_guidance(current_state_np)
+            action, log_prob, value, _ = self._select_guided_action(torch.tensor(current_state_np).float(), guidance)
+
             imagined_next_state, imagined_reward = self.dreamer.predict(current_state_np, action)
             
-            # Apply symbolic reward to the imagined reward
-            symbolic_reward = self.apply_symbolic_reward(imagined_next_state, action)
-            total_imagined_reward = imagined_reward + symbolic_reward
-
-            # Create an imagined experience and add it to the buffer
+            total_imagined_reward = self.compute_shaped_reward(imagined_reward, current_state_np, imagined_next_state, action)
+            
             imagined_exp = Experience(current_state_np, action, total_imagined_reward, imagined_next_state, False, log_prob.item(), value.item())
             imagined_experiences.append(imagined_exp)
 
             current_state_np = imagined_next_state
-            current_state = torch.tensor(current_state_np).float().unsqueeze(0)
 
         return imagined_experiences
 
@@ -299,7 +353,6 @@ class WorldModelBuilder(nn.Module):
             return 0
         
         for _ in range(self.ppo_epochs):
-            # Using all imagined experiences, as they are synthetic
             loss = self.get_policy_loss(imagined_experiences)
             self.optimizer_policy.zero_grad()
             loss.backward()
@@ -398,7 +451,7 @@ class WorldModelBuilder(nn.Module):
         synthetic_states = self.dreamer.generate_synthetic(high_states.float())
         
         for s in synthetic_states:
-            fake_exp = Experience(s.detach().numpy(), random.randint(0,3), 10, s.detach().numpy(), False, None, None)
+            fake_exp = Experience(s.detach().numpy(), random.randint(0,2), 10, s.detach().numpy(), False, None, None)
             self.main_buffer.push(fake_exp, priority=2.0)
 
     def sync_buffers(self):
@@ -416,113 +469,119 @@ class WorldModelBuilder(nn.Module):
 
     def athena_extract(self):
         """
-        Analyzes experiences to extract and store symbolic, causal rules for Acrobot.
-        The goal is to increase the value of -cos(theta1) - cos(theta2 + theta1).
+        Analyzes recent experiences from the good and bad buffers to extract
+        and store symbolic, causal rules for Acrobot.
         """
         if len(self.good_buffer) < 1 or len(self.bad_buffer) < 1:
             return
-
-        good_states = np.array([exp.state for exp in self.good_buffer.buffer])
-        good_actions = np.array([exp.action for exp in self.good_buffer.buffer])
-        good_next_states = np.array([exp.next_state for exp in self.good_buffer.buffer])
         
-        # Calculate the "height" of the Acrobot's end-effector
+        # Extract experiences from the good buffer
+        good_experiences = random.sample(self.good_buffer.buffer, min(10, len(self.good_buffer)))
+        good_states = np.array([exp.state for exp in good_experiences])
+        good_actions = np.array([exp.action for exp in good_experiences])
+        good_next_states = np.array([exp.next_state for exp in good_experiences])
+
+        # Extract experiences from the bad buffer
+        bad_experiences = random.sample(self.bad_buffer.buffer, min(10, len(self.bad_buffer)))
+        bad_states = np.array([exp.state for exp in bad_experiences])
+        bad_actions = np.array([exp.action for exp in bad_experiences])
+        bad_next_states = np.array([exp.next_state for exp in bad_experiences])
+
+        # 1. Learn Rules for Positive Height Change (Desirable)
+        # We look for a consistent action that leads to a height increase
+        # The height is based on the goal: -cos(theta1) - cos(theta1 + theta2)
         def get_height(states):
-            # The height is based on the goal condition: -cos(theta1) - cos(theta2 + theta1)
-            # which is not directly in the state. The state contains cos/sin of theta1 and theta2
-            # We can use the proxy value from the state: cos(theta1) and cos(theta2)
-            # The goal is to get the free end above a certain height, which requires the arm to be vertical.
-            # State[0] is cos(theta1), a value of -1 is pointing up.
-            # State[2] is cos(theta2), a value of -1 is also pointing up.
-            return -states[:, 0] - states[:, 2] # This is a simplified proxy for the goal
-            
-        good_heights_before = get_height(good_states)
-        good_heights_after = get_height(good_next_states)
+            return -states[:, 0] - (states[:, 0] * states[:, 2] - states[:, 1] * states[:, 3])
         
-        # Rule 1 (Desirable): Pushing in a direction that increases height
-        height_change = good_heights_after - good_heights_before
+        good_height_change = get_height(good_next_states) - get_height(good_states)
         
-        # We can find actions that consistently lead to a positive height change
-        if np.mean(height_change[good_actions == 2]) > 0.1: # Action 2 is positive torque
-            rule = {
-                'if': {'action': 2, 'effect': 'positive_height_change'},
-                'then': {'outcome': 'desirable', 'reward_bonus': 0.5}
-            }
-            if rule not in self.symbolic_knowledge_base['rules']:
-                self.symbolic_knowledge_base['rules'].append(rule)
+        for action in range(self.action_dim):
+            action_indices = np.where(good_actions == action)[0]
+            if len(action_indices) > 0:
+                avg_change = np.mean(good_height_change[action_indices])
+                if avg_change > 0.05: # Threshold for a significant positive change
+                    rule = {
+                        'if': {'action': action, 'effect': 'positive_height_change'},
+                        'then': {'outcome': 'desirable', 'reward_bonus': self.reward_shaping_params['athena_bonus']}
+                    }
+                    if rule not in self.symbolic_knowledge_base['rules']:
+                        self.symbolic_knowledge_base['rules'].append(rule)
         
-        if np.mean(height_change[good_actions == 0]) > 0.1: # Action 0 is negative torque
-            rule = {
-                'if': {'action': 0, 'effect': 'positive_height_change'},
-                'then': {'outcome': 'desirable', 'reward_bonus': 0.5}
-            }
-            if rule not in self.symbolic_knowledge_base['rules']:
-                self.symbolic_knowledge_base['rules'].append(rule)
-
-        # Rule 2 (Undesirable): Getting into a state where angular velocity is too high
-        bad_states = np.array([exp.state for exp in self.bad_buffer.buffer])
+        # 2. Learn Rules for High Angular Velocity (Undesirable)
+        # We look for actions that lead to excessively high velocities
+        high_velocity_threshold = 5.0
         
-        # The angular velocities are at indices 4 and 5
-        high_velocity_states = (np.abs(bad_states[:, 4]) > 5) | (np.abs(bad_states[:, 5]) > 10)
-        
-        if np.mean(high_velocity_states) > 0.5:
-            rule = {
-                'if': {'state': 'high_angular_velocity'},
-                'then': {'outcome': 'undesirable', 'reward_penalty': -1.0}
-            }
-            if rule not in self.symbolic_knowledge_base['rules']:
-                self.symbolic_knowledge_base['rules'].append(rule)
+        for action in range(self.action_dim):
+            action_indices = np.where(bad_actions == action)[0]
+            if len(action_indices) > 0:
+                avg_velocity_1 = np.mean(np.abs(bad_next_states[action_indices, 4]))
+                avg_velocity_2 = np.mean(np.abs(bad_next_states[action_indices, 5]))
+                if avg_velocity_1 > high_velocity_threshold or avg_velocity_2 > high_velocity_threshold:
+                    rule = {
+                        'if': {'action': action, 'effect': 'high_angular_velocity'},
+                        'then': {'outcome': 'undesirable', 'reward_penalty': self.reward_shaping_params['athena_penalty']}
+                    }
+                    if rule not in self.symbolic_knowledge_base['rules']:
+                        self.symbolic_knowledge_base['rules'].append(rule)
 
     def apply_symbolic_reward(self, current_state, current_action):
         """
-        Uses the learned symbolic knowledge to provide an additional reward signal for Acrobot.
+        Uses the learned symbolic knowledge to provide an additional reward signal.
         """
         symbolic_reward = 0.0
         
-        # The simplified height proxy for the current state
-        current_height_proxy = -current_state[0] - current_state[2]
+        current_height = -current_state[0] - (current_state[0] * current_state[2] - current_state[1] * current_state[3])
         
         for rule in self.symbolic_knowledge_base['rules']:
-            if 'action' in rule['if'] and rule['if']['action'] == current_action:
-                if rule['if']['effect'] == 'positive_height_change':
-                    # We can't know the "before" state, so we apply a bonus if the current
-                    # state is indicative of a good action.
-                    if current_height_proxy > 0: # a simple proxy
+            # Check for desirable rules
+            if rule['if'].get('action') == current_action:
+                if rule['if'].get('effect') == 'positive_height_change':
+                    # We can't know the 'before' state, so we check if the current state
+                    # is in a good configuration for this rule to be meaningful.
+                    if current_height > -1.0: # Check that we are not at the lowest point
                         symbolic_reward += rule['then']['reward_bonus']
-        
-        for rule in self.symbolic_knowledge_base['rules']:
-            if 'state' in rule['if'] and rule['if']['state'] == 'high_angular_velocity':
-                if (np.abs(current_state[4]) > 5) or (np.abs(current_state[5]) > 10):
+            
+            # Check for undesirable rules
+            if rule['if'].get('effect') == 'high_angular_velocity':
+                if (np.abs(current_state[4]) > 5.0 or np.abs(current_state[5]) > 5.0):
                     symbolic_reward += rule['then']['reward_penalty']
                     
         return symbolic_reward
     
     def train_step(self, env):
         """
-        Refactored training step:
-        1. Collect a small batch of real-world experience.
-        2. Update the world model components (dreamer, ICM).
-        3. Perform policy updates using imagined rollouts.
+        Refactored training step with the Symbolic Planner.
+        1. Collect a small batch of real-world experience, guided by the planner.
+        2. Update the world model components.
+        3. Perform policy updates using imagined rollouts, which are also guided.
         """
         
-        # Phase 1: Collect a small amount of real-world experience
         real_experiences = []
         state, _ = env.reset()
         done = False
+        truncated = False
         step_count = 0
-        while not done and step_count < 100: # Collect for a short while
-            state_tensor = torch.tensor(state).float().unsqueeze(0)
-            action, _, _, _ = self.get_ppo_action(state_tensor)
+        
+        self.planner.current_sub_goal_idx = 0 
+        
+        while not done and not truncated and step_count < 100:
+            
+            guidance = self.planner.provide_guidance(state)
+            action, log_prob, value, _ = self._select_guided_action(torch.tensor(state).float(), guidance)
+            
             next_state, reward, done, truncated, _ = env.step(action)
-            done = done or truncated
             
-            # Update buffers and extract knowledge from real experiences
+            # Now, we extract Athena's rules from the experiences
             self.athena_extract()
-            fun_score = self.compute_fun_score(reward, [reward], self.encode(state_tensor)[0])
-            icm_reward = self.update_icm([(state, action, reward, next_state, done, None, None)])
+
+            # The shaped reward now includes Athena's symbolic bonus/penalty
+            shaped_reward = self.compute_shaped_reward(reward, state, next_state, action)
             
-            total_reward = reward + self.alpha_fun * fun_score + self.alpha_icm * icm_reward
-            exp = Experience(state, action, total_reward, next_state, done, None, None)
+            fun_score = self.compute_fun_score(shaped_reward, [shaped_reward], self.encode(torch.tensor(state).float().unsqueeze(0))[0])
+            icm_reward = self.update_icm([(state, action, shaped_reward, next_state, done, None, None)])
+            
+            total_reward = shaped_reward + self.alpha_fun * fun_score + self.alpha_icm * icm_reward
+            exp = Experience(state, action, total_reward, next_state, done, log_prob.item(), value.item())
             self.main_buffer.push(exp)
             
             real_experiences.append(exp)
@@ -530,17 +589,14 @@ class WorldModelBuilder(nn.Module):
             step_count += 1
             self.steps += 1
             
-        # Phase 2: Update the World Model components
         if len(self.main_buffer) > self.batch_size:
-            batch, indices, _ = self.main_buffer.sample(self.batch_size)
+            batch, _, _ = self.main_buffer.sample(self.batch_size)
             self.dreamer.update(batch)
             for head_idx in range(3):
                 self.update_q(batch, head_idx)
             self.rehab_experiences()
             self.dream_generate()
 
-        # Phase 3: Train the policy on imagined rollouts
-        # Get a starting state from real experiences to seed the imagination
         if real_experiences:
             start_state_np = random.choice(real_experiences).state
             start_state_tensor = torch.tensor(start_state_np).float()
@@ -548,7 +604,6 @@ class WorldModelBuilder(nn.Module):
             imagined_experiences = self._imagination_rollout(start_state_tensor, rollout_length=50)
             policy_loss = self._update_policy_from_imagination(imagined_experiences)
             
-            # The rest of the main training loop is now moved into helper functions or superseded.
             self.eps = self.eps_end + (self.eps_start - self.eps_end) * math.exp(-1. * self.steps / self.eps_decay)
         
         return {'episode_reward': sum([exp.reward for exp in real_experiences]), 'policy_loss': policy_loss}
@@ -582,7 +637,7 @@ class WorldModelBuilder(nn.Module):
             self.archive = state['archive']
             self.steps = state['steps']
             self.symbolic_knowledge_base = state.get('symbolic_knowledge_base', {
-                'rules': [], 'dynamics': {}, 'goals': {}
+                'rules': []
             })
             self.faiss_features = state['faiss_features']
             
