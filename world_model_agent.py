@@ -400,7 +400,8 @@ class WorldModelBuilder(nn.Module):
 
     def athena_extract(self):
         """
-        Analyzes experiences to extract and store symbolic, causal rules.
+        Analyzes experiences to extract and store symbolic, causal rules for Acrobot.
+        The goal is to increase the value of -cos(theta1) - cos(theta2 + theta1).
         """
         if len(self.good_buffer) < 1 or len(self.bad_buffer) < 1:
             return
@@ -409,46 +410,73 @@ class WorldModelBuilder(nn.Module):
         good_actions = np.array([exp.action for exp in self.good_buffer.buffer])
         good_next_states = np.array([exp.next_state for exp in self.good_buffer.buffer])
         
-        if good_states.shape[0] > 10:
-            y_pos_change = good_next_states[:, 1] - good_states[:, 1]
-            thrust_actions = good_actions == 2
+        # Calculate the "height" of the Acrobot's end-effector
+        def get_height(states):
+            # The height is based on the goal condition: -cos(theta1) - cos(theta2 + theta1)
+            # which is not directly in the state. The state contains cos/sin of theta1 and theta2
+            # We can use the proxy value from the state: cos(theta1) and cos(theta2)
+            # The goal is to get the free end above a certain height, which requires the arm to be vertical.
+            # State[0] is cos(theta1), a value of -1 is pointing up.
+            # State[2] is cos(theta2), a value of -1 is also pointing up.
+            return -states[:, 0] - states[:, 2] # This is a simplified proxy for the goal
             
-            if np.mean(y_pos_change[thrust_actions]) > 0.05:
-                rule = {
-                    'if': {'action': 2, 'effect': 'positive_y_velocity'},
-                    'then': {'outcome': 'desirable', 'reward_bonus': 0.5}
-                }
-                if rule not in self.symbolic_knowledge_base['rules']:
-                    self.symbolic_knowledge_base['rules'].append(rule)
+        good_heights_before = get_height(good_states)
+        good_heights_after = get_height(good_next_states)
+        
+        # Rule 1 (Desirable): Pushing in a direction that increases height
+        height_change = good_heights_after - good_heights_before
+        
+        # We can find actions that consistently lead to a positive height change
+        if np.mean(height_change[good_actions == 2]) > 0.1: # Action 2 is positive torque
+            rule = {
+                'if': {'action': 2, 'effect': 'positive_height_change'},
+                'then': {'outcome': 'desirable', 'reward_bonus': 0.5}
+            }
+            if rule not in self.symbolic_knowledge_base['rules']:
+                self.symbolic_knowledge_base['rules'].append(rule)
+        
+        if np.mean(height_change[good_actions == 0]) > 0.1: # Action 0 is negative torque
+            rule = {
+                'if': {'action': 0, 'effect': 'positive_height_change'},
+                'then': {'outcome': 'desirable', 'reward_bonus': 0.5}
+            }
+            if rule not in self.symbolic_knowledge_base['rules']:
+                self.symbolic_knowledge_base['rules'].append(rule)
 
+        # Rule 2 (Undesirable): Getting into a state where angular velocity is too high
         bad_states = np.array([exp.state for exp in self.bad_buffer.buffer])
         
-        if bad_states.shape[0] > 10:
-            angle_too_large = np.abs(bad_states[:, 4]) > 0.5
-            
-            if np.mean(angle_too_large) > 0.5:
-                rule = {
-                    'if': {'state': 'angle_too_large'},
-                    'then': {'outcome': 'undesirable', 'reward_penalty': -1.0}
-                }
-                if rule not in self.symbolic_knowledge_base['rules']:
-                    self.symbolic_knowledge_base['rules'].append(rule)
+        # The angular velocities are at indices 4 and 5
+        high_velocity_states = (np.abs(bad_states[:, 4]) > 5) | (np.abs(bad_states[:, 5]) > 10)
+        
+        if np.mean(high_velocity_states) > 0.5:
+            rule = {
+                'if': {'state': 'high_angular_velocity'},
+                'then': {'outcome': 'undesirable', 'reward_penalty': -1.0}
+            }
+            if rule not in self.symbolic_knowledge_base['rules']:
+                self.symbolic_knowledge_base['rules'].append(rule)
 
     def apply_symbolic_reward(self, current_state, current_action):
         """
-        Uses the learned symbolic knowledge to provide an additional reward signal.
+        Uses the learned symbolic knowledge to provide an additional reward signal for Acrobot.
         """
         symbolic_reward = 0.0
-        for rule in self.symbolic_knowledge_base['rules']:
-            if 'action' in rule['if'] and rule['if']['action'] == current_action:
-                if rule['then']['outcome'] == 'desirable':
-                    symbolic_reward += rule['then']['reward_bonus']
-                elif rule['then']['outcome'] == 'undesirable':
-                    symbolic_reward += rule['then']['reward_penalty']
+        
+        # The simplified height proxy for the current state
+        current_height_proxy = -current_state[0] - current_state[2]
         
         for rule in self.symbolic_knowledge_base['rules']:
-            if 'state' in rule['if'] and rule['if']['state'] == 'angle_too_large':
-                if np.abs(current_state[4]) > 0.5:
+            if 'action' in rule['if'] and rule['if']['action'] == current_action:
+                if rule['if']['effect'] == 'positive_height_change':
+                    # We can't know the "before" state, so we apply a bonus if the current
+                    # state is indicative of a good action.
+                    if current_height_proxy > 0: # a simple proxy
+                        symbolic_reward += rule['then']['reward_bonus']
+        
+        for rule in self.symbolic_knowledge_base['rules']:
+            if 'state' in rule['if'] and rule['if']['state'] == 'high_angular_velocity':
+                if (np.abs(current_state[4]) > 5) or (np.abs(current_state[5]) > 10):
                     symbolic_reward += rule['then']['reward_penalty']
                     
         return symbolic_reward
