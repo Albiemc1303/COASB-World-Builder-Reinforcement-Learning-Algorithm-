@@ -15,14 +15,14 @@ import pandas as pd
 import copy
 
 # Import all the refactored modules
-from caosb_world_model.core.buffers import ExperienceReplayBuffer
-from caosb_world_model.core.experience import Experience
-from caosb_world_model.modules.dueling_dqn_head import DuelingDQNHead
-from caosb_world_model.modules.ppo_actor_critic import PPOActorCritic
-from caosb_world_model.modules.icm import ICMModule
-from caosb_world_model.modules.gan_rehab import WGANRehabModule
-from caosb_world_model.modules.dreamer_generator import DreamerGenerator
-from caosb_world_model.modules.noisy_layers import NoisyLinear
+from buffers import ExperienceReplayBuffer
+from experience import Experience
+from dueling_dqn_head import DuelingDQNHead
+from ppo_actor_critic import PPOActorCritic
+from icm import ICMModule
+from gan_rehab import WGANRehabModule
+from dreamer_generator import DreamerGenerator
+from noisy_layers import NoisyLinear
 
 class WorldModelBuilder(nn.Module):
     """
@@ -168,6 +168,7 @@ class WorldModelBuilder(nn.Module):
         dopamine = 0.01 + math.tanh(fun) + (1 if reward > 10 else 0) * 0.5
         self.fun_history.append(reward)
         return fun * dopamine
+        
 
     def update_q(self, batch, head_idx):
         """Updates one of the Q-networks using Double DQN and PER."""
