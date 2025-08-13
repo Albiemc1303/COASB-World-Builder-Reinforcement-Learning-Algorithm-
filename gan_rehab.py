@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from caosb_world_model.core.experience import Experience
+import experience import Experience
 
 class WGANRehabModule(nn.Module):
     """
