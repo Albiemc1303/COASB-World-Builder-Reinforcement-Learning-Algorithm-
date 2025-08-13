@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from caosb_world_model.modules.noisy_layers import NoisyLinear
+from noisy_layers import NoisyLinear
 
 class DuelingDQNHead(nn.Module):
     """
