@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-import experience import Experience
+from experience import Experience
 
 class WGANRehabModule(nn.Module):
     """

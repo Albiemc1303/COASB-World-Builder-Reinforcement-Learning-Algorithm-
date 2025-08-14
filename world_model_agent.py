@@ -75,7 +75,7 @@ class WorldModelBuilder(nn.Module):
         }
 
         # Core Networks
-        self.transformer_encoder = nn.TransformerEncoderLayer(d_model=state_dim, nhead=4, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoderLayer(d_model=state_dim, nhead=2, batch_first=True)
         self.encoder = nn.TransformerEncoder(self.transformer_encoder, num_layers=2)
         self.lstm = nn.LSTM(state_dim, self.latent_dim, batch_first=True)
 

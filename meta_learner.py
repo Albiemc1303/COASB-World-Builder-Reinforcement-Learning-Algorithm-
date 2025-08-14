@@ -5,6 +5,7 @@ import torch.optim as optim
 import copy
 from collections import deque
 import random
+from experience import Experience
 
 class MetaLearner:
     """
@@ -39,7 +40,7 @@ class MetaLearner:
             task_optimizer = optim.Adam(task_agent.parameters(), lr=inner_lr)
 
             # Step 2: Inner loop (Adapt to the task)
-            task_experiences = self.get_task_experiences(task) # This needs to be implemented externally
+            task_experiences = self.get_task_experiences(task, task_agent)
             for _ in range(num_inner_updates):
                 task_loss = self.calculate_task_loss(task_agent, task_experiences)
                 task_optimizer.zero_grad()
@@ -48,7 +49,7 @@ class MetaLearner:
 
             # Step 3: Evaluate adapted agent and get gradients for meta-update
             # We'll use a validation set for this, or a different batch of experiences from the same task
-            val_experiences = self.get_task_experiences(task)
+            val_experiences = self.get_task_experiences(task, task_agent)
             val_loss = self.calculate_task_loss(task_agent, val_experiences)
             val_loss.backward()
 
@@ -59,19 +60,45 @@ class MetaLearner:
         self.meta_optimizer.zero_grad()
         # Sum gradients from all tasks and apply them to the original agent
         for name, p in self.agent.named_parameters():
-            if name in meta_update_grads[0]:
-                p.grad = sum(g[name] for g in meta_update_grads) / len(task_batch)
+            if name in meta_update_grads[0] and meta_update_grads[0][name] is not None:
+                # Only sum gradients that are not None
+                valid_grads = [g[name] for g in meta_update_grads if g[name] is not None]
+                if valid_grads:
+                    p.grad = sum(valid_grads) / len(valid_grads)
         self.meta_optimizer.step()
 
-    def get_task_experiences(self, task):
+    def get_task_experiences(self, task, agent=None, num_episodes=5):
         """
-        Placeholder for fetching experiences from a specific task/environment.
-        This function needs to be implemented in the training loop.
+        Runs episodes in a given task environment to collect a batch of experiences.
+        
+        Args:
+            task: The task environment to collect experiences from
+            agent: The agent to use for collecting experiences (defaults to self.agent)
+            num_episodes: Number of episodes to run
+            
+        Returns:
+            List of Experience objects
         """
-        # For example, create an environment with different parameters
-        # and gather a small batch of data.
-        # This will be handled in main.py
-        pass
+        if agent is None:
+            agent = self.agent
+            
+        experiences = []
+        
+        for _ in range(num_episodes):
+            state, _ = task.reset()
+            done = False
+            hidden = None
+            while not done:
+                state_tensor = torch.tensor(state).float().unsqueeze(0)
+                action, log_prob, value, hidden = agent.get_ppo_action(state_tensor, hidden=hidden)
+                next_state, reward, done, truncated, info = task.step(action)
+                done = done or truncated
+                
+                exp = Experience(state, action, reward, next_state, done, log_prob, value)
+                experiences.append(exp)
+                state = next_state
+                
+        return experiences
 
     def calculate_task_loss(self, agent, experiences):
         """

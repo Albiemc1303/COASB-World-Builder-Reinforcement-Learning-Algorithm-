@@ -46,13 +46,15 @@ def create_task_env(start_range=0.1):
             self.start_range = start_range
 
         def reset(self, **kwargs):
-            # Resetting with a specific range for the initial state
-            high = np.array([self.start_range, self.start_range, self.start_range, self.start_range, self.start_range, self.start_range])
-            low = -high
-            self.unwrapped.state = self.unwrapped.np_random.uniform(low=low, high=high)
+            # First call the parent reset to properly initialize the environment
+            obs, info = self.env.reset(**kwargs)
             
-            # The base env.reset() returns a tuple (observation, info)
-            return self.env.unwrapped._get_obs(), {}
+            # For Acrobot, the state has 4 elements: [cos(theta1), sin(theta1), cos(theta2), sin(theta2), theta1_dot, theta2_dot]
+            # But the internal state might be different. Let's modify the observation instead.
+            # Apply the start_range scaling to the observation
+            scaled_obs = obs * self.start_range
+            
+            return scaled_obs, info
 
     return AcrobotTaskWrapper(env, start_range)
 
@@ -117,7 +119,7 @@ def main():
         done = False
         while not done:
             state_tensor = torch.tensor(state).float().unsqueeze(0).to(device)
-            action, _, _, _ = agent.select_action(state_tensor)
+            action, _ = agent.select_action(state_tensor)
             next_state, reward, done, truncated, _ = eval_env.step(action)
             done = done or truncated
             eval_reward += reward
